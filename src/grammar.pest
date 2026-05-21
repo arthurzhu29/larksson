@@ -1,0 +1,42 @@
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+
+file = _{ SOI ~ statement* ~ EOI }
+
+statement = {
+    set_statement
+    | print_statement
+}
+
+set_statement = {
+    var ~ "=" ~ value
+}
+
+print_statement = {
+    "print" ~ var
+}
+
+var = {
+    ("." ~ value)+ ~ "."
+}
+
+value = _{
+    number
+    | closed_var
+    | list
+}
+
+closed_var = {
+    "(" ~ var ~ ")"
+}
+
+list = {
+    "{" ~ (list_item ~ ("," ~ list_item)*)? ~ ","? ~ "}"
+}
+
+list_item = {
+    value ~ ":" ~ value
+}
+
+number = @{
+    ASCII_DIGIT+
+}
