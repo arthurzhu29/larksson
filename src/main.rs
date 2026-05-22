@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Read;
 
 use pest::Parser;
 use pest::iterators::{Pair, Pairs};
@@ -305,14 +306,28 @@ fn try_as_string(m: &BTreeMap<MyValue, MyValue>) -> Option<String> {
    MAIN
 ========================= */
 
-const INPUT: &str = r#"
-lines!
-.hello. = 5
-"#;
+fn read_source() -> String {
+    if let Some(path) = std::env::args().nth(1) {
+        std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            eprintln!("could not read {}: {}", path, e);
+            std::process::exit(1);
+        })
+    } else {
+        let mut s = String::new();
+        std::io::stdin()
+            .read_to_string(&mut s)
+            .unwrap_or_else(|e| {
+                eprintln!("could not read stdin: {}", e);
+                std::process::exit(1);
+            });
+        s
+    }
+}
 
 fn main() {
+    let src = read_source();
     let ast = build_ast(
-        MyParser::parse(Rule::file, INPUT)
+        MyParser::parse(Rule::file, &src)
             .unwrap_or_else(|e| panic!("parse error: {e}")),
     );
 

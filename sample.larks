@@ -1,0 +1,6 @@
+lines!
+.config.name. = "Claude"
+.config.version. = 47
+.config.tags. = ["ai", "assistant"]
+.alias. = (.config.name.)
+.delta. = -10
