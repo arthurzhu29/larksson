@@ -5,6 +5,8 @@ use pest::Parser;
 use pest::iterators::{Pair, Pairs};
 use pest_derive::Parser;
 
+mod ops;
+
 #[derive(Parser)]
 #[grammar = "grammar.pest"]
 struct MyParser;
@@ -160,7 +162,7 @@ fn eval(root: &MyValue, v: &Value) -> Result<MyValue, InterpError> {
         }
         Value::Deref(inner) => {
             let target = eval(root, inner)?;
-            walk(root, &target).cloned()
+            walk(root, iterate(&target)).cloned()
         }
     }
 }
@@ -177,9 +179,9 @@ fn iterate(x: &MyValue) -> impl Iterator<Item = &MyValue> {
     })
 }
 
-fn walk<'a>(root: &'a MyValue, path: &MyValue) -> Result<&'a MyValue, InterpError> {
+fn walk<'a, 'b>(root: &'a MyValue, path: impl Iterator<Item = &'b MyValue>) -> Result<&'a MyValue, InterpError> {
     let mut current = root;
-    for key in iterate(path) {
+    for key in path {
         let MyValue::Map(m) = current else {
             return Err(InterpError::IndexedScalar);
         };
@@ -191,20 +193,113 @@ fn walk<'a>(root: &'a MyValue, path: &MyValue) -> Result<&'a MyValue, InterpErro
 }
 
 fn assign(root: &mut MyValue, path: &MyValue, val: MyValue) -> Result<(), InterpError> {
-    if iterate(path).next().is_none() {
-        *root = val;
-        return Ok(());
+    let components: Vec<&MyValue> = iterate(path).collect();
+
+    if components.is_empty() {
+        panic!("cannot replace root: writes must go through a namespace");
     }
-    let mut current = root;
-    for key in iterate(path) {
+
+    check_write_path(&components);
+
+    let mut current = &mut *root;
+    for key in &components {
         if !matches!(current, MyValue::Map(_)) {
             *current = MyValue::Map(BTreeMap::new());
         }
         let MyValue::Map(m) = current else { unreachable!() };
-        current = m.entry(key.clone()).or_insert(MyValue::Val(0));
+        current = m.entry((*key).clone()).or_insert(MyValue::Val(0));
     }
     *current = val;
+
+    // Re-borrow the just-written value to inspect it.
+    let written = walk(root, components.iter().copied())?.clone();
+    maybe_fire(root, &components, &written)
+}
+
+fn check_write_path(components: &[&MyValue]) {
+    let first = myvalue_as_string(components[0])
+        .unwrap_or_else(|| panic!("first path component must be a string namespace"));
+    match first.as_str() {
+        "ops" => {
+            if components.len() >= 2 {
+                let opname = myvalue_as_string(components[1])
+                    .unwrap_or_else(|| panic!("ops name must be a string"));
+                if ops::op_registry(&opname).is_none() {
+                    panic!("unknown op: '{}'", opname);
+                }
+            }
+        }
+        "var" => {}
+        other => panic!("forbidden namespace: '{}' (allowed: ops, var)", other),
+    }
+}
+
+fn maybe_fire(
+    root: &mut MyValue,
+    components: &[&MyValue],
+    written: &MyValue,
+) -> Result<(), InterpError> {
+    // Must be inside .ops.<name>. at minimum.
+    if components.len() < 2 { return Ok(()); }
+    if myvalue_as_string(components[0]).as_deref() != Some("ops") { return Ok(()); }
+    let Some(opname) = myvalue_as_string(components[1]) else { return Ok(()); };
+
+    // Case A: path contains .ops.<name>.trigger.
+    if components.len() >= 3
+        && myvalue_as_string(components[2]).as_deref() == Some("trigger")
+    {
+        return fire_op(root, &opname);
+    }
+
+    // Case B: path ends at .ops.<name>. and written value contains a trigger key.
+    if components.len() == 2 {
+        if let MyValue::Map(m) = written {
+            if m.contains_key(&str_to_myvalue("trigger")) {
+                return fire_op(root, &opname);
+            }
+        }
+    }
+
     Ok(())
+}
+
+fn fire_op(root: &mut MyValue, opname: &str) -> Result<(), InterpError> {
+    // Namespace check guarantees the op is registered, so unwrap is safe.
+    let op_fn = ops::op_registry(opname).unwrap();
+
+    let args_path = build_path(&["ops", opname, "args"]);
+    let args = walk(root, iterate(&args_path))?.clone();
+
+    let result = op_fn(&args)?;
+
+    let return_path = build_path(&["ops", opname, "return"]);
+    assign(root, &return_path, result)
+}
+
+fn build_path(components: &[&str]) -> MyValue {
+    let mut m = BTreeMap::new();
+    for (i, s) in components.iter().enumerate() {
+        m.insert(MyValue::Val(i as i32), str_to_myvalue(s));
+    }
+    MyValue::Map(m)
+}
+
+fn str_to_myvalue(s: &str) -> MyValue {
+    let mut m = BTreeMap::new();
+    for (i, c) in s.chars().enumerate() {
+        m.insert(MyValue::Val(i as i32), MyValue::Val(c as i32));
+    }
+    MyValue::Map(m)
+}
+
+fn myvalue_as_string(v: &MyValue) -> Option<String> {
+    let MyValue::Map(m) = v else { return None; };
+    let mut s = String::new();
+    for i in 0i32..(m.len() as i32) {
+        let MyValue::Val(code) = m.get(&MyValue::Val(i))? else { return None; };
+        s.push(char::from_u32(*code as u32)?);
+    }
+    Some(s)
 }
 
 

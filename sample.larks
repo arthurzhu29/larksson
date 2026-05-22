@@ -1,6 +1,6 @@
 lines!
-.config.name. = "Claude"
-.config.version. = 47
-.config.tags. = ["ai", "assistant"]
-.alias. = (.config.name.)
-.delta. = -10
+.ops.add. = { args: { left: 5, right: 6 }, return: 0, trigger: 0 }
+.var.sum1. = (.ops.add.return.)
+.ops.add.args.left. = 6
+.ops.add.trigger. = 1
+.var.sum. = (.ops.add.return.)
