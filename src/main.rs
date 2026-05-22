@@ -9,24 +9,21 @@ use pest_derive::Parser;
 struct MyParser;
 
 /* =========================
-   AST DEFINITIONS
+   AST
 ========================= */
+
+#[derive(Debug, Clone)]
+pub enum Value {
+    Number(u32),
+    List(Vec<(Value, Value)>),
+    Deref(Box<Value>),
+}
 
 #[derive(Debug)]
 pub enum Statement {
-    Set { var: Var, value: Value },
+    Set { lhs: Value, rhs: Value },
     Print { value: Value },
 }
-
-#[derive(Debug)]
-pub enum Value {
-    Number(u32),
-    Var(Var),
-    List(Vec<(Value, Value)>),
-}
-
-#[derive(Debug)]
-pub struct Var(pub Vec<Value>);
 
 /* =========================
    AST BUILDER
@@ -42,93 +39,54 @@ fn build_ast(pairs: Pairs<Rule>) -> Vec<Statement> {
         .collect()
 }
 
-/* =========================
-   STATEMENTS
-========================= */
-
 fn parse_statement(mut pairs: Pairs<Rule>) -> Statement {
     let pair = pairs.next().unwrap();
-
     match pair.as_rule() {
-        Rule::set_statement => parse_set(pair.into_inner()),
-        Rule::print_statement => parse_print(pair.into_inner()),
+        Rule::set_statement => {
+            let mut inner = pair.into_inner();
+            let lhs = parse_value(inner.next().unwrap());
+            let rhs = parse_value(inner.next().unwrap());
+            Statement::Set { lhs, rhs }
+        }
+        Rule::print_statement => {
+            let value = parse_value(pair.into_inner().next().unwrap());
+            Statement::Print { value }
+        }
         r => unreachable!("unexpected rule in parse_statement: {:?}", r),
     }
 }
 
-fn parse_set(mut pairs: Pairs<Rule>) -> Statement {
-    let var = parse_var(pairs.next().unwrap());
-    let value = parse_value(pairs.next().unwrap());
-
-    Statement::Set { var, value }
-}
-
-fn parse_print(mut pairs: Pairs<Rule>) -> Statement {
-    let value = parse_value(pairs.next().unwrap());
-
-    Statement::Print { value }
-}
-
-/* =========================
-   VALUES
-========================= */
-
 fn parse_value(pair: Pair<Rule>) -> Value {
-    match pair.as_rule() {
-        Rule::number => Value::Number(pair.as_str().parse().unwrap()),
-
-        Rule::closed_var => {
-            let inner = pair.into_inner().next().unwrap();
-            Value::Var(parse_var(inner))
+    debug_assert_eq!(pair.as_rule(), Rule::value);
+    let inner = pair.into_inner().next().unwrap();
+    match inner.as_rule() {
+        Rule::number => Value::Number(inner.as_str().parse().unwrap()),
+        Rule::list => parse_list(inner.into_inner()),
+        Rule::deref => {
+            let v = parse_value(inner.into_inner().next().unwrap());
+            Value::Deref(Box::new(v))
         }
-
-        Rule::list => parse_list(pair.into_inner()),
-
         r => unreachable!("unexpected rule in parse_value: {:?}", r),
     }
 }
 
-/* =========================
-   VAR
-========================= */
-
-fn parse_var(pair: Pair<Rule>) -> Var {
-    let mut parts = vec![];
-
-    for inner in pair.into_inner() {
-        parts.push(parse_value(inner));
-    }
-
-    Var(parts)
-}
-
-/* =========================
-   LIST
-========================= */
-
 fn parse_list(pairs: Pairs<Rule>) -> Value {
     let mut items = vec![];
-
-    for pair in pairs {
-        if pair.as_rule() == Rule::list_item {
-            let mut inner = pair.into_inner();
-
-            let key = parse_value(inner.next().unwrap());
-            let value = parse_value(inner.next().unwrap());
-
-            items.push((key, value));
+    for p in pairs {
+        if p.as_rule() == Rule::list_item {
+            let mut it = p.into_inner();
+            let k = parse_value(it.next().unwrap());
+            let v = parse_value(it.next().unwrap());
+            items.push((k, v));
         }
     }
-
     Value::List(items)
 }
 
 /* =========================
-   INTERPRETER VALUES & ERRORS
+   RUNTIME VALUES & ERRORS
 ========================= */
 
-// BTreeMap gives us deterministic iteration order, which lets us derive
-// Hash and Ord directly instead of hand-rolling them.
 #[derive(Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Debug)]
 enum MyValue {
     Val(u32),
@@ -139,73 +97,104 @@ enum MyValue {
 enum InterpError {
     UndefinedKey(#[allow(dead_code)] MyValue),
     IndexedScalar,
+    PathNotMap,
 }
 
 /* =========================
    INTERPRETER
 ========================= */
 
-fn apply_to_root(root: &mut MyValue, stmt: &Statement) -> Result<(), InterpError> {
-    match stmt {
-        Statement::Print { value } => {
-            let val = resolve_value(root, value)?;
-            println!("{:?}", val);
-        }
-        Statement::Set { var, value } => {
-            let val = resolve_value(root, value)?;
-            set_var(root, &var.0, val)?;
-        }
-    }
-    Ok(())
-}
-
-fn resolve_value(root: &MyValue, value: &Value) -> Result<MyValue, InterpError> {
-    match value {
+/// Evaluate a Value to a concrete MyValue (no path interpretation).
+fn eval(root: &MyValue, v: &Value) -> Result<MyValue, InterpError> {
+    match v {
         Value::Number(n) => Ok(MyValue::Val(*n)),
-        Value::Var(v) => resolve_var(root, &v.0).cloned(),
-        Value::List(list) => {
-            let entries: Result<BTreeMap<_, _>, _> = list
-                .iter()
-                .map(|(k, v)| Ok((resolve_value(root, k)?, resolve_value(root, v)?)))
-                .collect();
-            Ok(MyValue::Map(entries?))
+        Value::List(items) => {
+            let mut map = BTreeMap::new();
+            for (k, v) in items {
+                map.insert(eval(root, k)?, eval(root, v)?);
+            }
+            Ok(MyValue::Map(map))
+        }
+        Value::Deref(inner) => {
+            // Evaluate the inner value, treat the result as a path, look up in root.
+            let target = eval(root, inner)?;
+            let path = as_path(&target)?;
+            walk(root, &path).cloned()
         }
     }
 }
 
-fn resolve_var<'a>(root: &'a MyValue, path: &[Value]) -> Result<&'a MyValue, InterpError> {
+/// Interpret a MyValue as a path: take entries at integer keys 0, 1, 2, ...
+/// in order, stopping when the next key is missing.
+///
+/// Examples:
+///   {0:5}            -> [5]
+///   {0:1, 1:3}       -> [1, 3]
+///   {}               -> []          (empty path = root itself)
+///   {0:1, 2:9}       -> [1]         (1 is missing; 9 is silently ignored)
+fn as_path(v: &MyValue) -> Result<Vec<MyValue>, InterpError> {
+    let MyValue::Map(m) = v else {
+        return Err(InterpError::PathNotMap);
+    };
+    let mut path = Vec::with_capacity(m.len());
+    for i in 0u32.. {
+        match m.get(&MyValue::Val(i)) {
+            Some(c) => path.push(c.clone()),
+            None => break,
+        }
+    }
+    Ok(path)
+}
+
+/// Walk root along path components (read-only).
+fn walk<'a>(root: &'a MyValue, path: &[MyValue]) -> Result<&'a MyValue, InterpError> {
     let mut current = root;
-    for val in path {
-        let MyValue::Map(map) = current else {
+    for key in path {
+        let MyValue::Map(m) = current else {
             return Err(InterpError::IndexedScalar);
         };
-        let key = resolve_value(root, val)?;
-        current = map.get(&key).ok_or(InterpError::UndefinedKey(key))?;
+        current = m
+            .get(key)
+            .ok_or_else(|| InterpError::UndefinedKey(key.clone()))?;
     }
     Ok(current)
 }
 
-fn set_var(root: &mut MyValue, path: &[Value], val: MyValue) -> Result<(), InterpError> {
-    // Resolve every path component against the current state up front, so the
-    // mutable traversal below doesn't need to re-borrow `root`. This replaces
-    // the previous full-tree clone with an O(path) walk.
-    let keys: Vec<MyValue> = path
-        .iter()
-        .map(|v| resolve_value(root, v))
-        .collect::<Result<_, _>>()?;
-
+/// Walk root along path components, creating intermediate maps as needed,
+/// and assign `val` at the end. Empty path replaces root.
+fn assign(root: &mut MyValue, path: &[MyValue], val: MyValue) -> Result<(), InterpError> {
+    if path.is_empty() {
+        *root = val;
+        return Ok(());
+    }
     let mut current = root;
-    for key in keys {
-        // Walking through a scalar destructively replaces it with a fresh map.
-        // This is intentional: `.1. = 5` followed by `.1.(.2.). = 3` overwrites
-        // the scalar 5 with the new nested structure.
+    for key in path {
+        // Walking through a scalar destructively replaces it with a fresh map,
+        // same policy as before.
         if !matches!(current, MyValue::Map(_)) {
             *current = MyValue::Map(BTreeMap::new());
         }
-        let MyValue::Map(map) = current else { unreachable!() };
-        current = map.entry(key).or_insert(MyValue::Val(0));
+        let MyValue::Map(m) = current else { unreachable!() };
+        current = m.entry(key.clone()).or_insert(MyValue::Val(0));
     }
     *current = val;
+    Ok(())
+}
+
+fn exec(root: &mut MyValue, stmt: &Statement) -> Result<(), InterpError> {
+    match stmt {
+        Statement::Print { value } => {
+            let v = eval(root, value)?;
+            println!("{:?}", v);
+        }
+        Statement::Set { lhs, rhs } => {
+            // LHS evaluated as a value, then reinterpreted as a path.
+            let lhs_val = eval(root, lhs)?;
+            let path = as_path(&lhs_val)?;
+            let rhs_val = eval(root, rhs)?;
+            assign(root, &path, rhs_val)?;
+        }
+    }
     Ok(())
 }
 
@@ -213,10 +202,14 @@ fn set_var(root: &mut MyValue, path: &[Value], val: MyValue) -> Result<(), Inter
    MAIN
 ========================= */
 
+// Translation of the old INPUT:
+//   .2. = 3                       ->  {0:2} = 3
+//   .1.(.2.). = {1:2, 3:4}        ->  {0:1, 1:({0:2})} = {1:2, 3:4}
+//   print .1.                     ->  print ({0:1})
 const INPUT: &str = r#"
-.2. = 3
-.1.(.2.). = {1:2, 3:4}
-print .1.
+{0:2} = 3
+{0:1, 1:({0:2})} = {1:2, 3:4}
+print ({0:1})
 "#;
 
 fn main() {
@@ -227,7 +220,7 @@ fn main() {
 
     let mut root = MyValue::Val(0);
     for stmt in &ast {
-        if let Err(e) = apply_to_root(&mut root, stmt) {
+        if let Err(e) = exec(&mut root, stmt) {
             eprintln!("runtime error in {:?}: {:?}", stmt, e);
         }
     }

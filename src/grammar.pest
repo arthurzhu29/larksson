@@ -8,29 +8,25 @@ statement = {
 }
 
 set_statement = {
-    var ~ "=" ~ value
+    value ~ "=" ~ value
 }
 
 print_statement = {
-    "print" ~ var
+    "print" ~ value
 }
 
-var = {
-    ("." ~ value)+ ~ "."
+deref = {
+    "(" ~ value ~ ")"
 }
 
-value = _{
+value = {
     number
-    | closed_var
     | list
-}
-
-closed_var = {
-    "(" ~ var ~ ")"
+    | deref
 }
 
 list = {
-    "{" ~ (list_item ~ ("," ~ list_item)*)? ~ ","? ~ "}"
+    "{" ~ (list_item ~ ("," ~ list_item)* ~ ","?)?  ~ "}"
 }
 
 list_item = {
