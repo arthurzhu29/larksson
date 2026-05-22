@@ -15,7 +15,7 @@ struct MyParser;
 #[derive(Debug)]
 pub enum Statement {
     Set { var: Var, value: Value },
-    Print { var: Var },
+    Print { value: Value },
 }
 
 #[derive(Debug)]
@@ -64,9 +64,9 @@ fn parse_set(mut pairs: Pairs<Rule>) -> Statement {
 }
 
 fn parse_print(mut pairs: Pairs<Rule>) -> Statement {
-    let var = parse_var(pairs.next().unwrap());
+    let value = parse_value(pairs.next().unwrap());
 
-    Statement::Print { var }
+    Statement::Print { value }
 }
 
 /* =========================
@@ -147,8 +147,8 @@ enum InterpError {
 
 fn apply_to_root(root: &mut MyValue, stmt: &Statement) -> Result<(), InterpError> {
     match stmt {
-        Statement::Print { var } => {
-            let val = resolve_var(root, &var.0)?;
+        Statement::Print { value } => {
+            let val = resolve_value(root, value)?;
             println!("{:?}", val);
         }
         Statement::Set { var, value } => {
