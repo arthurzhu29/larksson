@@ -7,32 +7,28 @@ statement = {
     | print_statement
 }
 
-set_statement = {
-    value ~ "=" ~ value
-}
-
-print_statement = {
-    "print" ~ value
-}
-
-deref = {
-    "(" ~ value ~ ")"
-}
+set_statement   = { value ~ "=" ~ value }
+print_statement = { "print" ~ value }
 
 value = {
     number
+    | char_lit
+    | string_lit
+    | array
+    | dot_path
     | list
     | deref
 }
 
-list = {
-    "{" ~ (list_item ~ ("," ~ list_item)* ~ ","?)?  ~ "}"
-}
+deref = { "(" ~ value ~ ")" }
 
-list_item = {
-    value ~ ":" ~ value
-}
+list      = { "{" ~ (list_item ~ ("," ~ list_item)* ~ ","?)? ~ "}" }
+list_item = { value ~ ":" ~ value }
 
-number = @{
-    ASCII_DIGIT+
-}
+array    = { "[" ~ (value ~ ("," ~ value)* ~ ","?)? ~ "]" }
+dot_path = { ("." ~ value)+ ~ "." }
+
+number = @{ "-"? ~ ASCII_DIGIT+ }
+
+char_lit   = @{ "'" ~ (("\\" ~ ANY) | (!"'" ~ ANY)) ~ "'" }
+string_lit = @{ "\"" ~ (("\\" ~ ANY) | (!"\"" ~ ANY))* ~ "\"" }

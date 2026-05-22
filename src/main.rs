@@ -10,11 +10,12 @@ struct MyParser;
 
 /* =========================
    AST
+   (All sugar desugars to these three forms at parse time.)
 ========================= */
 
 #[derive(Debug, Clone)]
 pub enum Value {
-    Number(u32),
+    Number(i32),
     List(Vec<(Value, Value)>),
     Deref(Box<Value>),
 }
@@ -60,7 +61,10 @@ fn parse_value(pair: Pair<Rule>) -> Value {
     debug_assert_eq!(pair.as_rule(), Rule::value);
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
-        Rule::number => Value::Number(inner.as_str().parse().unwrap()),
+        Rule::number => Value::Number(inner.as_str().parse::<i32>().expect("bad number")),
+        Rule::char_lit => Value::Number(parse_char_lit(inner.as_str()) as i32),
+        Rule::string_lit => parse_string_lit(inner.as_str()),
+        Rule::array | Rule::dot_path => parse_indexed(inner.into_inner()),
         Rule::list => parse_list(inner.into_inner()),
         Rule::deref => {
             let v = parse_value(inner.into_inner().next().unwrap());
@@ -68,6 +72,18 @@ fn parse_value(pair: Pair<Rule>) -> Value {
         }
         r => unreachable!("unexpected rule in parse_value: {:?}", r),
     }
+}
+
+/// Sugar: `[a, b, c]` and `.a.b.c.` both desugar to `{0:a, 1:b, 2:c}`.
+fn parse_indexed(pairs: Pairs<Rule>) -> Value {
+    let mut items = vec![];
+    let mut i = 0i32;
+    for p in pairs {
+        debug_assert_eq!(p.as_rule(), Rule::value);
+        items.push((Value::Number(i), parse_value(p)));
+        i += 1;
+    }
+    Value::List(items)
 }
 
 fn parse_list(pairs: Pairs<Rule>) -> Value {
@@ -83,13 +99,50 @@ fn parse_list(pairs: Pairs<Rule>) -> Value {
     Value::List(items)
 }
 
+/// `'c'` -> codepoint.
+fn parse_char_lit(s: &str) -> u32 {
+    let inner = &s[1..s.len() - 1];
+    decode_escaped_char(&mut inner.chars()).expect("empty char literal")
+}
+
+/// `"hello"` -> `{0:'h', 1:'e', ...}`.
+fn parse_string_lit(s: &str) -> Value {
+    let inner = &s[1..s.len() - 1];
+    let mut items = vec![];
+    let mut chars = inner.chars();
+    let mut i = 0i32;
+    while let Some(code) = decode_escaped_char(&mut chars) {
+        items.push((Value::Number(i), Value::Number(code as i32)));
+        i += 1;
+    }
+    Value::List(items)
+}
+
+fn decode_escaped_char(chars: &mut std::str::Chars) -> Option<u32> {
+    let c = chars.next()?;
+    Some(if c == '\\' {
+        match chars.next().expect("incomplete escape") {
+            'n' => '\n' as u32,
+            't' => '\t' as u32,
+            'r' => '\r' as u32,
+            '0' => '\0' as u32,
+            '\\' => '\\' as u32,
+            '\'' => '\'' as u32,
+            '"' => '"' as u32,
+            other => panic!("unknown escape: \\{}", other),
+        }
+    } else {
+        c as u32
+    })
+}
+
 /* =========================
    RUNTIME VALUES & ERRORS
 ========================= */
 
 #[derive(Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Debug)]
 enum MyValue {
-    Val(u32),
+    Val(i32),
     Map(BTreeMap<MyValue, MyValue>),
 }
 
@@ -104,7 +157,6 @@ enum InterpError {
    INTERPRETER
 ========================= */
 
-/// Evaluate a Value to a concrete MyValue (no path interpretation).
 fn eval(root: &MyValue, v: &Value) -> Result<MyValue, InterpError> {
     match v {
         Value::Number(n) => Ok(MyValue::Val(*n)),
@@ -116,7 +168,6 @@ fn eval(root: &MyValue, v: &Value) -> Result<MyValue, InterpError> {
             Ok(MyValue::Map(map))
         }
         Value::Deref(inner) => {
-            // Evaluate the inner value, treat the result as a path, look up in root.
             let target = eval(root, inner)?;
             let path = as_path(&target)?;
             walk(root, &path).cloned()
@@ -124,20 +175,14 @@ fn eval(root: &MyValue, v: &Value) -> Result<MyValue, InterpError> {
     }
 }
 
-/// Interpret a MyValue as a path: take entries at integer keys 0, 1, 2, ...
-/// in order, stopping when the next key is missing.
-///
-/// Examples:
-///   {0:5}            -> [5]
-///   {0:1, 1:3}       -> [1, 3]
-///   {}               -> []          (empty path = root itself)
-///   {0:1, 2:9}       -> [1]         (1 is missing; 9 is silently ignored)
+/// A path is a value's entries at integer keys 0, 1, 2, ... taken in order
+/// until the next key is missing.
 fn as_path(v: &MyValue) -> Result<Vec<MyValue>, InterpError> {
     let MyValue::Map(m) = v else {
         return Err(InterpError::PathNotMap);
     };
     let mut path = Vec::with_capacity(m.len());
-    for i in 0u32.. {
+    for i in 0i32.. {
         match m.get(&MyValue::Val(i)) {
             Some(c) => path.push(c.clone()),
             None => break,
@@ -146,7 +191,6 @@ fn as_path(v: &MyValue) -> Result<Vec<MyValue>, InterpError> {
     Ok(path)
 }
 
-/// Walk root along path components (read-only).
 fn walk<'a>(root: &'a MyValue, path: &[MyValue]) -> Result<&'a MyValue, InterpError> {
     let mut current = root;
     for key in path {
@@ -160,8 +204,6 @@ fn walk<'a>(root: &'a MyValue, path: &[MyValue]) -> Result<&'a MyValue, InterpEr
     Ok(current)
 }
 
-/// Walk root along path components, creating intermediate maps as needed,
-/// and assign `val` at the end. Empty path replaces root.
 fn assign(root: &mut MyValue, path: &[MyValue], val: MyValue) -> Result<(), InterpError> {
     if path.is_empty() {
         *root = val;
@@ -169,8 +211,6 @@ fn assign(root: &mut MyValue, path: &[MyValue], val: MyValue) -> Result<(), Inte
     }
     let mut current = root;
     for key in path {
-        // Walking through a scalar destructively replaces it with a fresh map,
-        // same policy as before.
         if !matches!(current, MyValue::Map(_)) {
             *current = MyValue::Map(BTreeMap::new());
         }
@@ -185,10 +225,10 @@ fn exec(root: &mut MyValue, stmt: &Statement) -> Result<(), InterpError> {
     match stmt {
         Statement::Print { value } => {
             let v = eval(root, value)?;
-            println!("{:?}", v);
+            print_value(&v);
+            println!();
         }
         Statement::Set { lhs, rhs } => {
-            // LHS evaluated as a value, then reinterpreted as a path.
             let lhs_val = eval(root, lhs)?;
             let path = as_path(&lhs_val)?;
             let rhs_val = eval(root, rhs)?;
@@ -199,17 +239,82 @@ fn exec(root: &mut MyValue, stmt: &Statement) -> Result<(), InterpError> {
 }
 
 /* =========================
+   PRETTY PRINTING
+
+   The runtime can't distinguish "{0:'h',1:'i'}" from "\"hi\"" from "[104,105]"
+   — they're all the same value. We pick the prettiest representation:
+     - 0..n-1 keys + all values ASCII-printable  -> string  "hi"
+     - 0..n-1 keys                               -> array   [104, 105]
+     - else                                      -> map     {k:v, ...}
+========================= */
+
+fn print_value(v: &MyValue) {
+    match v {
+        MyValue::Val(n) => print!("{}", n),
+        MyValue::Map(m) => {
+            if m.is_empty() {
+                print!("{{}}");
+                return;
+            }
+            if is_indexed(m) {
+                if let Some(s) = try_as_string(m) {
+                    print!("{:?}", s); // Rust's debug-quoting handles escapes
+                    return;
+                }
+                print!("[");
+                for i in 0i32..(m.len() as i32) {
+                    if i > 0 {
+                        print!(", ");
+                    }
+                    print_value(&m[&MyValue::Val(i)]);
+                }
+                print!("]");
+                return;
+            }
+            print!("{{");
+            for (i, (k, v)) in m.iter().enumerate() {
+                if i > 0 {
+                    print!(", ");
+                }
+                print_value(k);
+                print!(": ");
+                print_value(v);
+            }
+            print!("}}");
+        }
+    }
+}
+
+fn is_indexed(m: &BTreeMap<MyValue, MyValue>) -> bool {
+    (0i32..(m.len() as i32)).all(|i| m.contains_key(&MyValue::Val(i)))
+}
+
+fn try_as_string(m: &BTreeMap<MyValue, MyValue>) -> Option<String> {
+    let mut s = String::new();
+    for i in 0i32..(m.len() as i32) {
+        let MyValue::Val(code) = m.get(&MyValue::Val(i))? else {
+            return None;
+        };
+        if !(0x20..=0x7E).contains(code) {
+            return None;
+        }
+        s.push(*code as u8 as char);
+    }
+    Some(s)
+}
+
+/* =========================
    MAIN
 ========================= */
 
-// Translation of the old INPUT:
-//   .2. = 3                       ->  {0:2} = 3
-//   .1.(.2.). = {1:2, 3:4}        ->  {0:1, 1:({0:2})} = {1:2, 3:4}
-//   print .1.                     ->  print ({0:1})
 const INPUT: &str = r#"
-{0:2} = 3
-{0:1, 1:({0:2})} = {1:2, 3:4}
-print ({0:1})
+.2. = 3
+.1.(.2.). = {1:2, 3:4}
+print (.1.)
+print "hello"
+print 'A'
+print [-5, 0, 5]
+print [104, 101, 108, 108, 111]
 "#;
 
 fn main() {
