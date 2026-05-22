@@ -1,34 +1,32 @@
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 
-file = _{ SOI ~ statement* ~ EOI }
-
-statement = {
-    set_statement
-    | print_statement
-}
-
-set_statement   = { value ~ "=" ~ value }
-print_statement = { "print" ~ value }
+file = _{ SOI ~ (("lines!" ~ lines) | value) ~ EOI }
 
 value = {
     number
+    | list
+    | deref
+
     | char_lit
     | string_lit
     | array
     | dot_path
-    | list
-    | deref
+    | string
 }
 
-deref = { "(" ~ value ~ ")" }
 
+dot_path = { ("." ~ value)* ~ "." }
+
+
+number = @{ "-"? ~ ASCII_DIGIT+ }
+deref = { "(" ~ value ~ ")" }
 list      = { "{" ~ (list_item ~ ("," ~ list_item)* ~ ","?)? ~ "}" }
 list_item = { value ~ ":" ~ value }
 
-array    = { "[" ~ (value ~ ("," ~ value)* ~ ","?)? ~ "]" }
-dot_path = { ("." ~ value)+ ~ "." }
-
-number = @{ "-"? ~ ASCII_DIGIT+ }
-
 char_lit   = @{ "'" ~ (("\\" ~ ANY) | (!"'" ~ ANY)) ~ "'" }
 string_lit = @{ "\"" ~ (("\\" ~ ANY) | (!"\"" ~ ANY))* ~ "\"" }
+string = @{ ASCII_ALPHANUMERIC+ }
+array    = { "[" ~ (value ~ ("," ~ value)* ~ ","?)? ~ "]" }
+
+set_statement   = { value ~ "=" ~ value }
+lines = { (set_statement | value)* }

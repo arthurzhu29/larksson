@@ -13,47 +13,36 @@ struct MyParser;
    (All sugar desugars to these three forms at parse time.)
 ========================= */
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
 pub enum Value {
     Number(i32),
-    List(Vec<(Value, Value)>),
+    List(BTreeMap<Value, Value>),
     Deref(Box<Value>),
 }
 
-#[derive(Debug)]
-pub enum Statement {
-    Set { lhs: Value, rhs: Value },
-    Print { value: Value },
-}
 
 /* =========================
    AST BUILDER
 ========================= */
 
-fn build_ast(pairs: Pairs<Rule>) -> Vec<Statement> {
-    pairs
-        .filter_map(|p| match p.as_rule() {
-            Rule::statement => Some(parse_statement(p.into_inner())),
-            Rule::EOI => None,
-            r => unreachable!("unexpected top-level rule: {:?}", r),
-        })
-        .collect()
+fn build_ast(mut pairs: Pairs<Rule>) -> Value {
+    let got = pairs.next().unwrap();
+    match got.as_rule() {
+        Rule::value => return parse_value(got),
+        _ => {},
+    }
+    let pairs = got.into_inner()
+        .enumerate()
+        .map(|(i, p)| (Value::Number(i as i32), parse_value_or_set(p)))
+        .collect::<BTreeMap<_, _>>();
+    Value::List(pairs)
 }
 
-fn parse_statement(mut pairs: Pairs<Rule>) -> Statement {
-    let pair = pairs.next().unwrap();
+fn parse_value_or_set(pair: Pair<Rule>) -> Value {
     match pair.as_rule() {
-        Rule::set_statement => {
-            let mut inner = pair.into_inner();
-            let lhs = parse_value(inner.next().unwrap());
-            let rhs = parse_value(inner.next().unwrap());
-            Statement::Set { lhs, rhs }
-        }
-        Rule::print_statement => {
-            let value = parse_value(pair.into_inner().next().unwrap());
-            Statement::Print { value }
-        }
-        r => unreachable!("unexpected rule in parse_statement: {:?}", r),
+        Rule::set_statement => parse_indexed(pair.into_inner()),
+        Rule::value => parse_value(pair),
+        _ => unreachable!(),
     }
 }
 
@@ -66,6 +55,7 @@ fn parse_value(pair: Pair<Rule>) -> Value {
         Rule::string_lit => parse_string_lit(inner.as_str()),
         Rule::array | Rule::dot_path => parse_indexed(inner.into_inner()),
         Rule::list => parse_list(inner.into_inner()),
+        Rule::string => Value::List(inner.as_str().chars().enumerate().map(|(i, c)| (Value::Number(i as i32), Value::Number(c as i32))).collect()),
         Rule::deref => {
             let v = parse_value(inner.into_inner().next().unwrap());
             Value::Deref(Box::new(v))
@@ -76,24 +66,24 @@ fn parse_value(pair: Pair<Rule>) -> Value {
 
 /// Sugar: `[a, b, c]` and `.a.b.c.` both desugar to `{0:a, 1:b, 2:c}`.
 fn parse_indexed(pairs: Pairs<Rule>) -> Value {
-    let mut items = vec![];
+    let mut items = BTreeMap::new();
     let mut i = 0i32;
     for p in pairs {
         debug_assert_eq!(p.as_rule(), Rule::value);
-        items.push((Value::Number(i), parse_value(p)));
+        items.insert(Value::Number(i), parse_value(p));
         i += 1;
     }
     Value::List(items)
 }
 
 fn parse_list(pairs: Pairs<Rule>) -> Value {
-    let mut items = vec![];
+    let mut items = BTreeMap::new();
     for p in pairs {
         if p.as_rule() == Rule::list_item {
             let mut it = p.into_inner();
             let k = parse_value(it.next().unwrap());
             let v = parse_value(it.next().unwrap());
-            items.push((k, v));
+            items.insert(k, v);
         }
     }
     Value::List(items)
@@ -108,11 +98,11 @@ fn parse_char_lit(s: &str) -> u32 {
 /// `"hello"` -> `{0:'h', 1:'e', ...}`.
 fn parse_string_lit(s: &str) -> Value {
     let inner = &s[1..s.len() - 1];
-    let mut items = vec![];
+    let mut items = BTreeMap::new();
     let mut chars = inner.chars();
     let mut i = 0i32;
     while let Some(code) = decode_escaped_char(&mut chars) {
-        items.push((Value::Number(i), Value::Number(code as i32)));
+        items.insert(Value::Number(i), Value::Number(code as i32));
         i += 1;
     }
     Value::List(items)
@@ -150,7 +140,7 @@ enum MyValue {
 enum InterpError {
     UndefinedKey(#[allow(dead_code)] MyValue),
     IndexedScalar,
-    PathNotMap,
+    #[allow(unused)] PathNotMap,
 }
 
 /* =========================
@@ -169,31 +159,26 @@ fn eval(root: &MyValue, v: &Value) -> Result<MyValue, InterpError> {
         }
         Value::Deref(inner) => {
             let target = eval(root, inner)?;
-            let path = as_path(&target)?;
-            walk(root, &path).cloned()
+            walk(root, &target).cloned()
         }
     }
 }
 
-/// A path is a value's entries at integer keys 0, 1, 2, ... taken in order
-/// until the next key is missing.
-fn as_path(v: &MyValue) -> Result<Vec<MyValue>, InterpError> {
-    let MyValue::Map(m) = v else {
-        return Err(InterpError::PathNotMap);
+fn iterate(x: &MyValue) -> impl Iterator<Item = &MyValue> {
+    let MyValue::Map(m) = x else {
+        panic!();
     };
-    let mut path = Vec::with_capacity(m.len());
-    for i in 0i32.. {
-        match m.get(&MyValue::Val(i)) {
-            Some(c) => path.push(c.clone()),
-            None => break,
-        }
-    }
-    Ok(path)
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        let got = m.get(&MyValue::Val(i));
+        i += 1;
+        got
+    })
 }
 
-fn walk<'a>(root: &'a MyValue, path: &[MyValue]) -> Result<&'a MyValue, InterpError> {
+fn walk<'a>(root: &'a MyValue, path: &MyValue) -> Result<&'a MyValue, InterpError> {
     let mut current = root;
-    for key in path {
+    for key in iterate(path) {
         let MyValue::Map(m) = current else {
             return Err(InterpError::IndexedScalar);
         };
@@ -204,13 +189,13 @@ fn walk<'a>(root: &'a MyValue, path: &[MyValue]) -> Result<&'a MyValue, InterpEr
     Ok(current)
 }
 
-fn assign(root: &mut MyValue, path: &[MyValue], val: MyValue) -> Result<(), InterpError> {
-    if path.is_empty() {
+fn assign(root: &mut MyValue, path: &MyValue, val: MyValue) -> Result<(), InterpError> {
+    if iterate(path).next().is_none() {
         *root = val;
         return Ok(());
     }
     let mut current = root;
-    for key in path {
+    for key in iterate(path) {
         if !matches!(current, MyValue::Map(_)) {
             *current = MyValue::Map(BTreeMap::new());
         }
@@ -221,21 +206,34 @@ fn assign(root: &mut MyValue, path: &[MyValue], val: MyValue) -> Result<(), Inte
     Ok(())
 }
 
-fn exec(root: &mut MyValue, stmt: &Statement) -> Result<(), InterpError> {
-    match stmt {
-        Statement::Print { value } => {
-            let v = eval(root, value)?;
-            print_value(&v);
-            println!();
+
+fn exec(root: &mut MyValue, instructions: &Value) -> Result<(), InterpError> {
+    let mut i = 0;
+    let Value::List(list) = instructions else {
+        panic!();
+    };
+    while let Some(val) = list.get(&Value::Number(i)) {
+        let Value::List(list) = val else {
+            panic!();
+        };
+        let Some(a) = list.get(&Value::Number(0)) else {
+            panic!();
+        };
+        let Some(b) = list.get(&Value::Number(1)) else {
+            panic!();
+        };
+        if let Err(e) = do_set(root, a, b) {
+            eprintln!("runtime error in {:?}: {:?}", val, e);
         }
-        Statement::Set { lhs, rhs } => {
-            let lhs_val = eval(root, lhs)?;
-            let path = as_path(&lhs_val)?;
-            let rhs_val = eval(root, rhs)?;
-            assign(root, &path, rhs_val)?;
-        }
+        i += 1;
     }
     Ok(())
+}
+
+fn do_set(root: &mut MyValue, from: &Value, to: &Value) -> Result<(), InterpError> {
+    let from = eval(root, from)?;
+    let to = eval(root, to)?;
+    assign(root, &from, to)
 }
 
 /* =========================
@@ -308,13 +306,8 @@ fn try_as_string(m: &BTreeMap<MyValue, MyValue>) -> Option<String> {
 ========================= */
 
 const INPUT: &str = r#"
-.2. = 3
-.1.(.2.). = {1:2, 3:4}
-print (.1.)
-print "hello"
-print 'A'
-print [-5, 0, 5]
-print [104, 101, 108, 108, 111]
+lines!
+.hello. = 5
 "#;
 
 fn main() {
@@ -324,9 +317,6 @@ fn main() {
     );
 
     let mut root = MyValue::Val(0);
-    for stmt in &ast {
-        if let Err(e) = exec(&mut root, stmt) {
-            eprintln!("runtime error in {:?}: {:?}", stmt, e);
-        }
-    }
+    exec(&mut root, &ast).unwrap();
+    print_value(&root);
 }
