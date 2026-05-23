@@ -281,16 +281,42 @@ fn maybe_fire(
 }
 
 fn fire_op(root: &mut MyValue, opname: &str) -> Result<(), InterpError> {
-    // Namespace check guarantees the op is registered, so unwrap is safe.
     let op_fn = ops::op_registry(opname).unwrap();
-
     let args_path = build_path(&["ops", opname, "args"]);
     let args = walk(root, iterate(&args_path))?.clone();
-
-    let result = op_fn(&args)?;
-
+    let result = op_fn(root, &args)?;          // <- root now passed
     let return_path = build_path(&["ops", opname, "return"]);
     assign(root, &return_path, result)
+}
+
+pub(crate) fn exec_mv(root: &mut MyValue, instructions: &MyValue) -> Result<(), InterpError> {
+    let MyValue::Map(list) = instructions else { panic!("program must be a map"); };
+    let mut i = 0i32;
+    while let Some(val) = list.get(&MyValue::Val(i)) {
+        let MyValue::Map(stmt) = val else { panic!("statement must be a map"); };
+        let Some(a) = stmt.get(&MyValue::Val(0)) else { panic!("statement missing lhs"); };
+        let Some(b) = stmt.get(&MyValue::Val(1)) else { panic!("statement missing rhs"); };
+        let depth: i32 = match stmt.get(&MyValue::Val(2)) {
+            Some(MyValue::Val(n)) => *n,
+            None => 0,
+            _ => panic!("statement depth must be a number"),
+        };
+        if let Err(e) = do_set_mv(root, a, b, depth) {
+            eprintln!("runtime error in {:?}: {:?}", val, e);
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+fn do_set_mv(root: &mut MyValue, from: &MyValue, to: &MyValue, depth: i32) -> Result<(), InterpError> {
+    // No eval here: stored programs hold already-evaluated MyValues.
+    // LHS goes straight to assign as a path; RHS gets path-followed `depth` times.
+    let mut to = to.clone();
+    for _ in 0..depth {
+        to = walk(root, iterate(&to))?.clone();
+    }
+    assign(root, from, to)
 }
 
 fn build_path(components: &[&str]) -> MyValue {

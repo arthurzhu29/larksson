@@ -1,5 +1,5 @@
 lines!
-.var.x. = 5
-.var.y. = 10
-.var.target. = .var.x.
-.var.z. <- .var.target.
+.var.x. = 1
+.var.prog. = [[.var.x., 99, 0]]
+.ops.run.args.program. <- .var.prog.
+.ops.run.trigger. = 0
