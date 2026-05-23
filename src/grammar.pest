@@ -11,6 +11,7 @@ value = {
     | string_lit
     | array
     | dot_path
+    | self_lit
     | string
 }
 
@@ -27,7 +28,8 @@ char_lit   = @{ "'" ~ (("\\" ~ ANY) | (!"'" ~ ANY)) ~ "'" }
 string_lit = @{ "\"" ~ (("\\" ~ ANY) | (!"\"" ~ ANY))* ~ "\"" }
 string = @{ ASCII_ALPHANUMERIC+ }
 array    = { "[" ~ (value ~ ("," ~ value)* ~ ","?)? ~ "]" }
+self_lit = @{ "<>" }
 
-set_statement = { value ~ assign_op ~ value }
-assign_op = { "=" | "<-" }
+set_statement   = { value ~ assign_op ~ value }
+assign_op       = { "=" | "<-" | "->" }
 lines = { (set_statement | value)* }

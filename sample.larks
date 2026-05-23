@@ -1,5 +1,7 @@
 lines!
 .var.x. = 1
-.var.prog. = [[.var.x., 99, 0]]
+.var.scratch. = 99
+.var.scratch. = <>
+.var.prog. = [[[.var.x., 0], [42, 0]]]
 .ops.run.args.program. <- .var.prog.
 .ops.run.trigger. = 0

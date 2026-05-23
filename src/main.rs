@@ -13,7 +13,6 @@ struct MyParser;
 
 /* =========================
    AST
-   (All sugar desugars to these three forms at parse time.)
 ========================= */
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
@@ -21,6 +20,7 @@ pub enum Value {
     Number(i32),
     List(BTreeMap<Value, Value>),
     Deref(Box<Value>),
+    SelfSentinel,
 }
 
 
@@ -41,6 +41,10 @@ fn build_ast(mut pairs: Pairs<Rule>) -> Value {
     Value::List(pairs)
 }
 
+/// Statement shape: [[lhs, lhs_depth], [rhs, rhs_depth]].
+///   `a = b`  -> [[a, 0], [b, 0]]
+///   `a <- b` -> [[a, 0], [b, 1]]
+///   `a -> b` -> [[a, 1], [b, 0]]
 fn parse_value_or_set(pair: Pair<Rule>) -> Value {
     match pair.as_rule() {
         Rule::set_statement => {
@@ -48,18 +52,24 @@ fn parse_value_or_set(pair: Pair<Rule>) -> Value {
             let lhs = parse_value(inner.next().unwrap());
             let op  = inner.next().unwrap();
             debug_assert_eq!(op.as_rule(), Rule::assign_op);
-            let depth: i32 = match op.as_str() {
-                "="  => 0,
-                "<-" => 1,
+            let (lhs_d, rhs_d): (i32, i32) = match op.as_str() {
+                "="  => (0, 0),
+                "<-" => (0, 1),
+                "->" => (1, 0),
                 other => unreachable!("unknown assign op: {}", other),
             };
             let rhs = parse_value(inner.next().unwrap());
 
-            let mut m = BTreeMap::new();
-            m.insert(Value::Number(0), lhs);
-            m.insert(Value::Number(1), rhs);
-            m.insert(Value::Number(2), Value::Number(depth));
-            Value::List(m)
+            Value::List(BTreeMap::from([
+                (Value::Number(0), Value::List(BTreeMap::from([
+                    (Value::Number(0), lhs),
+                    (Value::Number(1), Value::Number(lhs_d)),
+                ]))),
+                (Value::Number(1), Value::List(BTreeMap::from([
+                    (Value::Number(0), rhs),
+                    (Value::Number(1), Value::Number(rhs_d)),
+                ]))),
+            ]))
         }
         Rule::value => parse_value(pair),
         _ => unreachable!(),
@@ -76,6 +86,7 @@ fn parse_value(pair: Pair<Rule>) -> Value {
         Rule::array | Rule::dot_path => parse_indexed(inner.into_inner()),
         Rule::list => parse_list(inner.into_inner()),
         Rule::string => Value::List(inner.as_str().chars().enumerate().map(|(i, c)| (Value::Number(i as i32), Value::Number(c as i32))).collect()),
+        Rule::self_lit => Value::SelfSentinel,
         Rule::deref => {
             let v = parse_value(inner.into_inner().next().unwrap());
             Value::Deref(Box::new(v))
@@ -84,7 +95,6 @@ fn parse_value(pair: Pair<Rule>) -> Value {
     }
 }
 
-/// Sugar: `[a, b, c]` and `.a.b.c.` both desugar to `{0:a, 1:b, 2:c}`.
 fn parse_indexed(pairs: Pairs<Rule>) -> Value {
     let mut items = BTreeMap::new();
     let mut i = 0i32;
@@ -109,13 +119,11 @@ fn parse_list(pairs: Pairs<Rule>) -> Value {
     Value::List(items)
 }
 
-/// `'c'` -> codepoint.
 fn parse_char_lit(s: &str) -> u32 {
     let inner = &s[1..s.len() - 1];
     decode_escaped_char(&mut inner.chars()).expect("empty char literal")
 }
 
-/// `"hello"` -> `{0:'h', 1:'e', ...}`.
 fn parse_string_lit(s: &str) -> Value {
     let inner = &s[1..s.len() - 1];
     let mut items = BTreeMap::new();
@@ -151,29 +159,95 @@ fn decode_escaped_char(chars: &mut std::str::Chars) -> Option<u32> {
 ========================= */
 
 #[derive(Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Debug)]
-enum MyValue {
+pub enum MyValue {
+    /// The self sentinel. Sorts before all other values (declared first).
+    /// Produced by reads of missing keys; never appears in stored data
+    /// (writes-of-self are filtered or remove the key).
+    Self_,
+    /// Native integer storage. Conceptually equivalent to a unary-shape map
+    /// (see `myvalue_to_num` / `num_to_myvalue` for the conversion);
+    /// kept as a fast representation that ops convert from/to.
     Val(i32),
     Map(BTreeMap<MyValue, MyValue>),
 }
 
+static SELF_VALUE: MyValue = MyValue::Self_;
+pub(crate) fn self_ref<'a>() -> &'a MyValue { &SELF_VALUE }
+
 #[derive(Debug)]
-enum InterpError {
-    UndefinedKey(#[allow(dead_code)] MyValue),
-    IndexedScalar,
-    #[allow(unused)] PathNotMap,
+pub enum InterpError {
+    MalformedStatement,
 }
 
 /* =========================
-   INTERPRETER
+   NUMBER ENCODING
+   Conceptually, every number is a map:
+     0 = {}
+     1 = {{}: {}}
+     2 = {{{}: {}}: {}}
+     n = {n-1: {}}
+   We store as Val(i32) for speed. Convert at boundaries only.
+========================= */
+
+pub(crate) fn num_to_myvalue(n: i32) -> MyValue {
+    if n < 0 {
+        panic!("negative numbers not representable in unary encoding: {}", n);
+    }
+    // Iterative to avoid stack overflow on large n.
+    let mut current = MyValue::Map(BTreeMap::new());
+    for _ in 0..n {
+        let mut m = BTreeMap::new();
+        m.insert(current, MyValue::Map(BTreeMap::new()));
+        current = MyValue::Map(m);
+    }
+    current
+}
+
+/// Returns Some(n) if v is either Val(n) or a canonical unary-form Map of n.
+pub(crate) fn myvalue_to_num(v: &MyValue) -> Option<i32> {
+    if let MyValue::Val(n) = v {
+        return Some(*n);
+    }
+    let mut count = 0i32;
+    let mut current = v;
+    loop {
+        let MyValue::Map(m) = current else { return None; };
+        if m.is_empty() {
+            return Some(count);
+        }
+        if m.len() != 1 {
+            return None;
+        }
+        let (key, val) = m.iter().next().unwrap();
+        // Value must be Map(empty), i.e., 0 in unary.
+        match val {
+            MyValue::Map(vm) if vm.is_empty() => {}
+            _ => return None,
+        }
+        current = key;
+        count = count.checked_add(1)?;
+    }
+}
+
+/* =========================
+   EVAL
 ========================= */
 
 fn eval(root: &MyValue, v: &Value) -> Result<MyValue, InterpError> {
     match v {
         Value::Number(n) => Ok(MyValue::Val(*n)),
+        Value::SelfSentinel => Ok(MyValue::Self_),
         Value::List(items) => {
             let mut map = BTreeMap::new();
             for (k, v) in items {
-                map.insert(eval(root, k)?, eval(root, v)?);
+                let key = eval(root, k)?;
+                let val = eval(root, v)?;
+                // Self-valued entries are filtered at construction; storing
+                // self anywhere is illegal.
+                if matches!(val, MyValue::Self_) {
+                    continue;
+                }
+                map.insert(key, val);
             }
             Ok(MyValue::Map(map))
         }
@@ -184,12 +258,15 @@ fn eval(root: &MyValue, v: &Value) -> Result<MyValue, InterpError> {
     }
 }
 
+/* =========================
+   PATH MACHINERY
+========================= */
+
 fn iterate(x: &MyValue) -> impl Iterator<Item = &MyValue> {
-    let MyValue::Map(m) = x else {
-        panic!();
-    };
-    let mut i = 0;
+    let m = if let MyValue::Map(m) = x { Some(m) } else { None };
+    let mut i = 0i32;
     std::iter::from_fn(move || {
+        let m = m?;
         let got = m.get(&MyValue::Val(i));
         i += 1;
         got
@@ -199,15 +276,26 @@ fn iterate(x: &MyValue) -> impl Iterator<Item = &MyValue> {
 fn walk<'a, 'b>(root: &'a MyValue, path: impl Iterator<Item = &'b MyValue>) -> Result<&'a MyValue, InterpError> {
     let mut current = root;
     for key in path {
-        let MyValue::Map(m) = current else {
-            return Err(InterpError::IndexedScalar);
-        };
-        current = m
-            .get(key)
-            .ok_or_else(|| InterpError::UndefinedKey(key.clone()))?;
+        match current {
+            MyValue::Map(m) => {
+                current = m.get(key).unwrap_or(self_ref());
+            }
+            MyValue::Self_ | MyValue::Val(_) => {
+                // Indexing into self yields self (self acts like {}).
+                // Indexing into a number conceptually materializes its unary form;
+                // the only key that would match in that form is num_to_myvalue(n-1),
+                // a deeply-nested Map that no realistic path component equals.
+                // So lookups effectively always miss: return self.
+                current = self_ref();
+            }
+        }
     }
     Ok(current)
 }
+
+/* =========================
+   ASSIGNMENT
+========================= */
 
 fn assign(root: &mut MyValue, path: &MyValue, val: MyValue) -> Result<(), InterpError> {
     let components: Vec<&MyValue> = iterate(path).collect();
@@ -217,33 +305,67 @@ fn assign(root: &mut MyValue, path: &MyValue, val: MyValue) -> Result<(), Interp
     }
 
     check_write_path(&components);
+    check_write_value(&components, &val);
 
+    // Writing self removes the keyed entry.
+    if matches!(val, MyValue::Self_) {
+        remove_at(root, &components);
+        return Ok(());
+    }
+
+    // Walk to the target slot, creating intermediate maps as needed.
     let mut current = &mut *root;
     for key in &components {
         if !matches!(current, MyValue::Map(_)) {
             *current = MyValue::Map(BTreeMap::new());
         }
         let MyValue::Map(m) = current else { unreachable!() };
-        current = m.entry((*key).clone()).or_insert(MyValue::Val(0));
+        current = m.entry((*key).clone()).or_insert_with(|| MyValue::Map(BTreeMap::new()));
     }
     *current = val;
 
-    // Re-borrow the just-written value to inspect it.
     let written = walk(root, components.iter().copied())?.clone();
     maybe_fire(root, &components, &written)
 }
+
+fn remove_at(root: &mut MyValue, components: &[&MyValue]) {
+    if components.is_empty() {
+        return;
+    }
+    let mut current = &mut *root;
+    for key in &components[..components.len() - 1] {
+        match current {
+            MyValue::Map(m) => {
+                if let Some(next) = m.get_mut(*key) {
+                    current = next;
+                } else {
+                    return;
+                }
+            }
+            _ => return,
+        }
+    }
+    if let MyValue::Map(m) = current {
+        m.remove(components[components.len() - 1]);
+    }
+}
+
+/* =========================
+   NAMESPACE AND TRIGGER ENFORCEMENT
+========================= */
 
 fn check_write_path(components: &[&MyValue]) {
     let first = myvalue_as_string(components[0])
         .unwrap_or_else(|| panic!("first path component must be a string namespace"));
     match first.as_str() {
         "ops" => {
-            if components.len() >= 2 {
-                let opname = myvalue_as_string(components[1])
-                    .unwrap_or_else(|| panic!("ops name must be a string"));
-                if ops::op_registry(&opname).is_none() {
-                    panic!("unknown op: '{}'", opname);
-                }
+            if components.len() < 2 {
+                panic!("cannot write to .ops. directly");
+            }
+            let opname = myvalue_as_string(components[1])
+                .unwrap_or_else(|| panic!("ops name must be a string"));
+            if ops::op_registry(&opname).is_none() {
+                panic!("unknown op: '{}'", opname);
             }
         }
         "var" => {}
@@ -251,24 +373,70 @@ fn check_write_path(components: &[&MyValue]) {
     }
 }
 
+fn check_write_value(components: &[&MyValue], val: &MyValue) {
+    if myvalue_as_string(components[0]).as_deref() != Some("ops") {
+        return;
+    }
+
+    // Removing .ops.<op>. or .ops.<op>.trigger. is illegal (kills the trigger slot).
+    if matches!(val, MyValue::Self_) {
+        if components.len() == 2 {
+            panic!("cannot delete .ops.<op>. (would remove trigger field)");
+        }
+        if components.len() == 3
+            && myvalue_as_string(components[2]).as_deref() == Some("trigger")
+        {
+            panic!("cannot remove trigger field");
+        }
+        return;
+    }
+
+    // Writing to .ops.<op>.trigger. directly: must be zero.
+    if components.len() == 3
+        && myvalue_as_string(components[2]).as_deref() == Some("trigger")
+    {
+        validate_trigger_value(val);
+        return;
+    }
+
+    // Writing the whole op record: if it contains a trigger key, validate that.
+    if components.len() == 2 {
+        if let MyValue::Map(m) = val {
+            if let Some(trigger_val) = m.get(&str_to_myvalue("trigger")) {
+                validate_trigger_value(trigger_val);
+            }
+        }
+    }
+}
+
+fn validate_trigger_value(val: &MyValue) {
+    // Accept either representation of zero: Val(0) or Map(empty).
+    match val {
+        MyValue::Val(0) => {}
+        MyValue::Map(m) if m.is_empty() => {}
+        _ => panic!("trigger may only be set to 0 or {{}}, got {:?}", val),
+    }
+}
+
+/* =========================
+   TRIGGER FIRING
+========================= */
+
 fn maybe_fire(
     root: &mut MyValue,
     components: &[&MyValue],
     written: &MyValue,
 ) -> Result<(), InterpError> {
-    // Must be inside .ops.<name>. at minimum.
     if components.len() < 2 { return Ok(()); }
     if myvalue_as_string(components[0]).as_deref() != Some("ops") { return Ok(()); }
     let Some(opname) = myvalue_as_string(components[1]) else { return Ok(()); };
 
-    // Case A: path contains .ops.<name>.trigger.
     if components.len() >= 3
         && myvalue_as_string(components[2]).as_deref() == Some("trigger")
     {
         return fire_op(root, &opname);
     }
 
-    // Case B: path ends at .ops.<name>. and written value contains a trigger key.
     if components.len() == 2 {
         if let MyValue::Map(m) = written {
             if m.contains_key(&str_to_myvalue("trigger")) {
@@ -284,24 +452,38 @@ fn fire_op(root: &mut MyValue, opname: &str) -> Result<(), InterpError> {
     let op_fn = ops::op_registry(opname).unwrap();
     let args_path = build_path(&["ops", opname, "args"]);
     let args = walk(root, iterate(&args_path))?.clone();
-    let result = op_fn(root, &args)?;          // <- root now passed
+    let result = op_fn(root, &args)?;
     let return_path = build_path(&["ops", opname, "return"]);
     assign(root, &return_path, result)
 }
 
-pub(crate) fn exec_mv(root: &mut MyValue, instructions: &MyValue) -> Result<(), InterpError> {
-    let MyValue::Map(list) = instructions else { panic!("program must be a map"); };
-    let mut i = 0i32;
-    while let Some(val) = list.get(&MyValue::Val(i)) {
-        let MyValue::Map(stmt) = val else { panic!("statement must be a map"); };
-        let Some(a) = stmt.get(&MyValue::Val(0)) else { panic!("statement missing lhs"); };
-        let Some(b) = stmt.get(&MyValue::Val(1)) else { panic!("statement missing rhs"); };
-        let depth: i32 = match stmt.get(&MyValue::Val(2)) {
-            Some(MyValue::Val(n)) => *n,
-            None => 0,
-            _ => panic!("statement depth must be a number"),
+/* =========================
+   STATEMENT EXECUTION
+========================= */
+
+fn exec(root: &mut MyValue, instructions: &Value) -> Result<(), InterpError> {
+    let Value::List(list) = instructions else {
+        // Top-level isn't a list: nothing to execute (file was a plain value).
+        return Ok(());
+    };
+    let mut i = 0;
+    while let Some(val) = list.get(&Value::Number(i)) {
+        let Value::List(stmt) = val else {
+            eprintln!("not a statement: {:?}", val);
+            i += 1;
+            continue;
         };
-        if let Err(e) = do_set_mv(root, a, b, depth) {
+        let Some(lhs_pair) = stmt.get(&Value::Number(0)) else {
+            eprintln!("statement missing lhs pair: {:?}", val);
+            i += 1;
+            continue;
+        };
+        let Some(rhs_pair) = stmt.get(&Value::Number(1)) else {
+            eprintln!("statement missing rhs pair: {:?}", val);
+            i += 1;
+            continue;
+        };
+        if let Err(e) = do_set(root, lhs_pair, rhs_pair) {
             eprintln!("runtime error in {:?}: {:?}", val, e);
         }
         i += 1;
@@ -309,15 +491,120 @@ pub(crate) fn exec_mv(root: &mut MyValue, instructions: &MyValue) -> Result<(), 
     Ok(())
 }
 
-fn do_set_mv(root: &mut MyValue, from: &MyValue, to: &MyValue, depth: i32) -> Result<(), InterpError> {
-    // No eval here: stored programs hold already-evaluated MyValues.
-    // LHS goes straight to assign as a path; RHS gets path-followed `depth` times.
-    let mut to = to.clone();
-    for _ in 0..depth {
-        to = walk(root, iterate(&to))?.clone();
+fn do_set(root: &mut MyValue, lhs_pair: &Value, rhs_pair: &Value) -> Result<(), InterpError> {
+    let (lhs_expr, lhs_depth) = extract_pair_value(lhs_pair)?;
+    let (rhs_expr, rhs_depth) = extract_pair_value(rhs_pair)?;
+
+    let mut lhs = eval(root, lhs_expr)?;
+    for _ in 0..lhs_depth {
+        lhs = walk(root, iterate(&lhs))?.clone();
     }
-    assign(root, from, to)
+
+    let mut rhs = eval(root, rhs_expr)?;
+    for _ in 0..rhs_depth {
+        rhs = walk(root, iterate(&rhs))?.clone();
+    }
+
+    assign(root, &lhs, rhs)
 }
+
+fn extract_pair_value(pair: &Value) -> Result<(&Value, i32), InterpError> {
+    let Value::List(m) = pair else {
+        return Err(InterpError::MalformedStatement);
+    };
+    let expr = m.get(&Value::Number(0)).ok_or(InterpError::MalformedStatement)?;
+    let depth = match m.get(&Value::Number(1)) {
+        Some(Value::Number(n)) => *n,
+        None => 0,
+        _ => return Err(InterpError::MalformedStatement),
+    };
+    Ok((expr, depth))
+}
+
+pub(crate) fn exec_mv(root: &mut MyValue, instructions: &MyValue) -> Result<(), InterpError> {
+    let MyValue::Map(list) = instructions else {
+        return Ok(());
+    };
+    let mut i = 0i32;
+    while let Some(val) = list.get(&MyValue::Val(i)) {
+        let MyValue::Map(stmt) = val else {
+            eprintln!("not a statement: {:?}", val);
+            i += 1;
+            continue;
+        };
+        let Some(lhs_pair) = stmt.get(&MyValue::Val(0)) else {
+            eprintln!("statement missing lhs pair: {:?}", val);
+            i += 1;
+            continue;
+        };
+        let Some(rhs_pair) = stmt.get(&MyValue::Val(1)) else {
+            eprintln!("statement missing rhs pair: {:?}", val);
+            i += 1;
+            continue;
+        };
+        if let Err(e) = do_set_mv(root, lhs_pair, rhs_pair) {
+            eprintln!("runtime error in {:?}: {:?}", val, e);
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+fn do_set_mv(root: &mut MyValue, lhs_pair: &MyValue, rhs_pair: &MyValue) -> Result<(), InterpError> {
+    let (lhs_val, lhs_depth) = extract_pair_mv(lhs_pair)?;
+    let (rhs_val, rhs_depth) = extract_pair_mv(rhs_pair)?;
+
+    let mut lhs = lhs_val.clone();
+    for _ in 0..lhs_depth {
+        lhs = walk(root, iterate(&lhs))?.clone();
+    }
+
+    let mut rhs = rhs_val.clone();
+    for _ in 0..rhs_depth {
+        rhs = walk(root, iterate(&rhs))?.clone();
+    }
+
+    assign(root, &lhs, rhs)
+}
+
+fn extract_pair_mv(pair: &MyValue) -> Result<(&MyValue, i32), InterpError> {
+    let MyValue::Map(m) = pair else {
+        return Err(InterpError::MalformedStatement);
+    };
+    let val = m.get(&MyValue::Val(0)).ok_or(InterpError::MalformedStatement)?;
+    let depth_val = m.get(&MyValue::Val(1));
+    let depth = match depth_val {
+        Some(v) => myvalue_to_num(v).ok_or(InterpError::MalformedStatement)?,
+        None => 0,
+    };
+    Ok((val, depth))
+}
+
+/* =========================
+   PRE-INITIALIZATION
+========================= */
+
+fn preinit_ops(root: &mut MyValue) {
+    for &name in ops::registered_op_names() {
+        ensure_path(root, &["ops", name, "trigger"], MyValue::Map(BTreeMap::new()));
+    }
+}
+
+fn ensure_path(root: &mut MyValue, components: &[&str], val: MyValue) {
+    let mut current = root;
+    for c in components {
+        if !matches!(current, MyValue::Map(_)) {
+            *current = MyValue::Map(BTreeMap::new());
+        }
+        let MyValue::Map(m) = current else { unreachable!() };
+        current = m.entry(str_to_myvalue(c)).or_insert_with(|| MyValue::Map(BTreeMap::new()));
+    }
+    *current = val;
+}
+
+/* =========================
+   HELPERS
+========================= */
 
 fn build_path(components: &[&str]) -> MyValue {
     let mut m = BTreeMap::new();
@@ -327,7 +614,7 @@ fn build_path(components: &[&str]) -> MyValue {
     MyValue::Map(m)
 }
 
-fn str_to_myvalue(s: &str) -> MyValue {
+pub(crate) fn str_to_myvalue(s: &str) -> MyValue {
     let mut m = BTreeMap::new();
     for (i, c) in s.chars().enumerate() {
         m.insert(MyValue::Val(i as i32), MyValue::Val(c as i32));
@@ -345,63 +632,38 @@ fn myvalue_as_string(v: &MyValue) -> Option<String> {
     Some(s)
 }
 
-fn exec(root: &mut MyValue, instructions: &Value) -> Result<(), InterpError> {
-    let mut i = 0;
-    let Value::List(list) = instructions else { panic!(); };
-    while let Some(val) = list.get(&Value::Number(i)) {
-        let Value::List(stmt) = val else { panic!(); };
-        let Some(a) = stmt.get(&Value::Number(0)) else { panic!(); };
-        let Some(b) = stmt.get(&Value::Number(1)) else { panic!(); };
-        let depth = match stmt.get(&Value::Number(2)) {
-            Some(Value::Number(n)) => *n,
-            None => 0, // tolerate stored programs without the slot
-            _ => panic!("statement depth must be a number"),
-        };
-
-        if let Err(e) = do_set(root, a, b, depth) {
-            eprintln!("runtime error in {:?}: {:?}", val, e);
+pub(crate) fn lookup<'a>(v: &'a MyValue, key: &str) -> &'a MyValue {
+    if let MyValue::Map(m) = v {
+        if let Some(val) = m.get(&str_to_myvalue(key)) {
+            return val;
         }
-        i += 1;
     }
-    Ok(())
-}
-
-fn do_set(root: &mut MyValue, from: &Value, to: &Value, depth: i32) -> Result<(), InterpError> {
-    let from = eval(root, from)?;       // LHS: evaluate once, treat as path. Unchanged.
-    let mut to = eval(root, to)?;       // RHS: evaluate once (existing behavior).
-
-    // For depth N, follow the path on the RHS N additional times.
-    // depth=0 → eager, no extra follow.
-    // depth=1 → `<-`, one extra follow.
-    // depth≥2 → reserved for the generalization you might keep open.
-    for _ in 0..depth {
-        to = walk(root, iterate(&to))?.clone();
-    }
-
-    assign(root, &from, to)
+    self_ref()
 }
 
 /* =========================
    PRETTY PRINTING
-
-   The runtime can't distinguish "{0:'h',1:'i'}" from "\"hi\"" from "[104,105]"
-   — they're all the same value. We pick the prettiest representation:
-     - 0..n-1 keys + all values ASCII-printable  -> string  "hi"
-     - 0..n-1 keys                               -> array   [104, 105]
-     - else                                      -> map     {k:v, ...}
 ========================= */
 
 fn print_value(v: &MyValue) {
     match v {
+        MyValue::Self_ => print!("<self>"),
         MyValue::Val(n) => print!("{}", n),
         MyValue::Map(m) => {
+            // Try unary number first; if it matches, render as decimal.
+            if let Some(n) = myvalue_to_num(v) {
+                print!("{}", n);
+                return;
+            }
             if m.is_empty() {
+                // Unreachable in practice — empty map = 0 via myvalue_to_num —
+                // but keep for safety.
                 print!("{{}}");
                 return;
             }
             if is_indexed(m) {
                 if let Some(s) = try_as_string(m) {
-                    print!("{:?}", s); // Rust's debug-quoting handles escapes
+                    print!("{:?}", s);
                     return;
                 }
                 print!("[");
@@ -475,7 +737,9 @@ fn main() {
             .unwrap_or_else(|e| panic!("parse error: {e}")),
     );
 
-    let mut root = MyValue::Val(0);
+    let mut root = MyValue::Map(BTreeMap::new());
+    preinit_ops(&mut root);
     exec(&mut root, &ast).unwrap();
     print_value(&root);
+    println!();
 }

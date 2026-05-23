@@ -10,21 +10,24 @@ pub fn op_registry(name: &str) -> Option<OpFn> {
     }
 }
 
+pub fn registered_op_names() -> &'static [&'static str] {
+    &["add", "run"]
+}
+
 fn op_add(_root: &mut MyValue, args: &MyValue) -> Result<MyValue, InterpError> {
-    let MyValue::Map(m) = args else { panic!("op args must be a map"); };
-    let left  = m.get(&str_to_myvalue("left"))
-        .unwrap_or_else(|| panic!("add: missing arg 'left'"));
-    let right = m.get(&str_to_myvalue("right"))
-        .unwrap_or_else(|| panic!("add: missing arg 'right'"));
-    let MyValue::Val(l) = left  else { panic!("add: 'left' must be a number"); };
-    let MyValue::Val(r) = right else { panic!("add: 'right' must be a number"); };
+    let left  = lookup(args, "left");
+    let right = lookup(args, "right");
+    let l = myvalue_to_num(left)
+        .unwrap_or_else(|| panic!("add: 'left' is not a number, got {:?}", left));
+    let r = myvalue_to_num(right)
+        .unwrap_or_else(|| panic!("add: 'right' is not a number, got {:?}", right));
     Ok(MyValue::Val(l + r))
 }
 
 fn op_run(root: &mut MyValue, args: &MyValue) -> Result<MyValue, InterpError> {
-    let MyValue::Map(m) = args else { panic!("op args must be a map"); };
-    let program = m.get(&str_to_myvalue("program"))
-        .unwrap_or_else(|| panic!("run: missing arg 'program'"));
+    let program = lookup(args, "program");
     exec_mv(root, program)?;
-    Ok(MyValue::Val(0)) // run has no meaningful return; placeholder
+    // run has no meaningful return value. Returning Self_ causes
+    // .ops.run.return. to be removed (write-of-self → delete).
+    Ok(MyValue::Self_)
 }
