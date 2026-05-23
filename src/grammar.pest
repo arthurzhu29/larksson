@@ -28,5 +28,6 @@ string_lit = @{ "\"" ~ (("\\" ~ ANY) | (!"\"" ~ ANY))* ~ "\"" }
 string = @{ ASCII_ALPHANUMERIC+ }
 array    = { "[" ~ (value ~ ("," ~ value)* ~ ","?)? ~ "]" }
 
-set_statement   = { value ~ "=" ~ value }
+set_statement = { value ~ assign_op ~ value }
+assign_op = { "=" | "<-" }
 lines = { (set_statement | value)* }

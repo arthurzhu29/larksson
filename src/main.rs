@@ -43,7 +43,24 @@ fn build_ast(mut pairs: Pairs<Rule>) -> Value {
 
 fn parse_value_or_set(pair: Pair<Rule>) -> Value {
     match pair.as_rule() {
-        Rule::set_statement => parse_indexed(pair.into_inner()),
+        Rule::set_statement => {
+            let mut inner = pair.into_inner();
+            let lhs = parse_value(inner.next().unwrap());
+            let op  = inner.next().unwrap();
+            debug_assert_eq!(op.as_rule(), Rule::assign_op);
+            let depth: i32 = match op.as_str() {
+                "="  => 0,
+                "<-" => 1,
+                other => unreachable!("unknown assign op: {}", other),
+            };
+            let rhs = parse_value(inner.next().unwrap());
+
+            let mut m = BTreeMap::new();
+            m.insert(Value::Number(0), lhs);
+            m.insert(Value::Number(1), rhs);
+            m.insert(Value::Number(2), Value::Number(depth));
+            Value::List(m)
+        }
         Rule::value => parse_value(pair),
         _ => unreachable!(),
     }
@@ -302,23 +319,20 @@ fn myvalue_as_string(v: &MyValue) -> Option<String> {
     Some(s)
 }
 
-
 fn exec(root: &mut MyValue, instructions: &Value) -> Result<(), InterpError> {
     let mut i = 0;
-    let Value::List(list) = instructions else {
-        panic!();
-    };
+    let Value::List(list) = instructions else { panic!(); };
     while let Some(val) = list.get(&Value::Number(i)) {
-        let Value::List(list) = val else {
-            panic!();
+        let Value::List(stmt) = val else { panic!(); };
+        let Some(a) = stmt.get(&Value::Number(0)) else { panic!(); };
+        let Some(b) = stmt.get(&Value::Number(1)) else { panic!(); };
+        let depth = match stmt.get(&Value::Number(2)) {
+            Some(Value::Number(n)) => *n,
+            None => 0, // tolerate stored programs without the slot
+            _ => panic!("statement depth must be a number"),
         };
-        let Some(a) = list.get(&Value::Number(0)) else {
-            panic!();
-        };
-        let Some(b) = list.get(&Value::Number(1)) else {
-            panic!();
-        };
-        if let Err(e) = do_set(root, a, b) {
+
+        if let Err(e) = do_set(root, a, b, depth) {
             eprintln!("runtime error in {:?}: {:?}", val, e);
         }
         i += 1;
@@ -326,9 +340,18 @@ fn exec(root: &mut MyValue, instructions: &Value) -> Result<(), InterpError> {
     Ok(())
 }
 
-fn do_set(root: &mut MyValue, from: &Value, to: &Value) -> Result<(), InterpError> {
-    let from = eval(root, from)?;
-    let to = eval(root, to)?;
+fn do_set(root: &mut MyValue, from: &Value, to: &Value, depth: i32) -> Result<(), InterpError> {
+    let from = eval(root, from)?;       // LHS: evaluate once, treat as path. Unchanged.
+    let mut to = eval(root, to)?;       // RHS: evaluate once (existing behavior).
+
+    // For depth N, follow the path on the RHS N additional times.
+    // depth=0 → eager, no extra follow.
+    // depth=1 → `<-`, one extra follow.
+    // depth≥2 → reserved for the generalization you might keep open.
+    for _ in 0..depth {
+        to = walk(root, iterate(&to))?.clone();
+    }
+
     assign(root, &from, to)
 }
 
