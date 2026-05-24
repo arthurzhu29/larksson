@@ -5,7 +5,6 @@ file = _{ SOI ~ (("lines!" ~ lines) | value) ~ EOI }
 value = {
     number
     | list
-    | deref
 
     | char_lit
     | string_lit
@@ -13,6 +12,7 @@ value = {
     | dot_path
     | self_lit
     | string
+    | atomic
 }
 
 
@@ -20,7 +20,7 @@ dot_path = { ("." ~ value)* ~ "." }
 
 
 number = @{ "-"? ~ ASCII_DIGIT+ }
-deref = { "(" ~ value ~ ")" }
+atomic = { "*" ~ number }
 list      = { "{" ~ (list_item ~ ("," ~ list_item)* ~ ","?)? ~ "}" }
 list_item = { value ~ ":" ~ value }
 
