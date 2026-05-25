@@ -1,0 +1,2 @@
+I will use atomics for primitive lengths and indices and primitives (usize) for
+the lengths and indices of other lists.

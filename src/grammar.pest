@@ -9,6 +9,7 @@ value = {
     | char_lit
     | string_lit
     | array
+    | sys_list
     | dot_path
     | self_lit
     | string
@@ -28,6 +29,7 @@ char_lit   = @{ "'" ~ (("\\" ~ ANY) | (!"'" ~ ANY)) ~ "'" }
 string_lit = @{ "\"" ~ (("\\" ~ ANY) | (!"\"" ~ ANY))* ~ "\"" }
 string = @{ ASCII_ALPHANUMERIC+ }
 array    = { "[" ~ (value ~ ("," ~ value)* ~ ","?)? ~ "]" }
+sys_list    = { "(" ~ (value ~ ("," ~ value)* ~ ","?)? ~ ")" }
 self_lit = @{ "<>" }
 
 set_statement   = { value ~ assign_op ~ value }
